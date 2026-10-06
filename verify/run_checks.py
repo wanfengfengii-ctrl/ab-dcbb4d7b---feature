@@ -228,6 +228,113 @@ class Smoke:
         })
         self.check("oversized kernel rejected with 400", code == 400, f"got {code}")
 
+        # Case 6: compatibility -- a request without kernelTolerance keeps the
+        # exact nominal response shape (no robust-only keys leak out).
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+        })
+        self.check("nominal request still returns 200", code == 200, f"got {code}: {body}")
+        if code == 200:
+            self.check(
+                "nominal response shape is unchanged",
+                set(body) == {
+                    "status", "events", "amplitudes", "prediction",
+                    "residuals", "objectives",
+                },
+                f"got {sorted(body)}",
+            )
+
+        # Robust fixtures: taps 0/1 may each deviate by +/-1 (tap 2 has value
+        # 1 so its tolerance must be 0 to keep the minimum tap positive).
+        tolerance = [1, 1, 0]
+
+        # Case 7: robust success -- the recovered train must cover every
+        # allowed kernel within the residual limit, and intervals are returned.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 30, "maxAmplitude": 10, "maxEvents": 6,
+            "kernelTolerance": tolerance,
+        })
+        self.check("robust overlap returns 200", code == 200, f"got {code}: {body}")
+        if code == 200:
+            self.check("robust response flagged robust", body.get("robust") is True)
+            pred_intervals = body.get("predictionIntervals")
+            res_intervals = body.get("residualIntervals")
+            self.check("robust prediction intervals per sample",
+                       isinstance(pred_intervals, list) and len(pred_intervals) == n)
+            self.check("robust residual intervals per sample",
+                       isinstance(res_intervals, list) and len(res_intervals) == n)
+            amps = body.get("amplitudes", [])
+            covers_all = True
+            intervals_tight = True
+            for d0 in (-1, 0, 1):
+                for d1 in (-1, 0, 1):
+                    k_allowed = [kernel[0] + d0, kernel[1] + d1, kernel[2]]
+                    for i in range(n):
+                        pred = sum(
+                            k_allowed[j] * amps[i - j]
+                            for j in range(len(kernel)) if i - j >= 0
+                        )
+                        if abs(exact_samples[i] - pred) > 30:
+                            covers_all = False
+                        rlo, rhi = res_intervals[i]
+                        if not (rlo <= exact_samples[i] - pred <= rhi):
+                            intervals_tight = False
+            self.check("robust train covers every allowed kernel", covers_all)
+            self.check("robust residual intervals bound every kernel",
+                       intervals_tight)
+            worst = [max(abs(lo), abs(hi)) for lo, hi in res_intervals]
+            objectives = body.get("objectives", {})
+            self.check(
+                "robust worst-case objectives",
+                objectives.get("maxAbsResidual") == max(worst)
+                and objectives.get("sumAbsResidual") == sum(worst)
+                and objectives.get("maxAbsResidual", 99) <= 30,
+                f"got {objectives}",
+            )
+            self.check(
+                "robust prediction retains nominal prediction",
+                body.get("prediction")
+                == _convolve({e["position"]: e["amplitude"]
+                              for e in body.get("events", [])}, kernel, n),
+            )
+
+        # Case 8: robust infeasibility -- no train covers all allowed kernels
+        # at zero residual; the first unexplainable position is reported.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 6,
+            "kernelTolerance": tolerance,
+        })
+        self.check("robust tight limit returns 422", code == 422, f"got {code}: {body}")
+        self.check("robust infeasible flagged",
+                   body.get("status") == "infeasible" and body.get("robust") is True)
+        self.check("robust first unexplainable position",
+                   body.get("firstUnexplainablePosition") == 4,
+                   f"got {body.get('firstUnexplainablePosition')}")
+
+        # Case 9: malformed tolerance fields are request errors on the field.
+        for bad_tolerance, label in [
+            ([1, 1], "length mismatch (short)"),
+            ([1, 1, 0, 0], "length mismatch (long)"),
+            ([-1, 0, 0], "negative entry"),
+            ([3, 0, 0], "minimum tap non-positive"),
+        ]:
+            code, body = _request("POST", "/api/pulses/deconvolve", {
+                "samples": exact_samples, "kernel": kernel,
+                "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+                "kernelTolerance": bad_tolerance,
+            })
+            located = (
+                code == 400
+                and body.get("status") == "invalid_request"
+                and any("kernelTolerance" in e.get("loc", [])
+                        for e in body.get("detail", []))
+            )
+            self.check(f"invalid tolerance ({label}) rejected per field",
+                       located, f"got {code}: {body}")
+
         ok = not self.failures
         print(f"smoke tests: {'PASS' if ok else 'FAIL'}", flush=True)
         return ok

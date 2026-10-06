@@ -18,6 +18,14 @@ def convolve(amplitudes, kernel):
     ]
 
 
+def allowed_kernels(kernel, tolerance):
+    """Cartesian product of the integer interval each tap may take."""
+    return itertools.product(
+        *[range(kernel[j] - tolerance[j], kernel[j] + tolerance[j] + 1)
+          for j in range(len(kernel))]
+    )
+
+
 def brute_force(samples, kernel, max_residual, max_amplitude, max_events):
     """Exhaustive reference: optimum key + first unexplainable position.
 
@@ -190,6 +198,168 @@ class TestBruteForceCrossCheck:
         assert result.prediction == convolve(result.amplitudes, kernel)
         assert result.residuals == [samples[i] - result.prediction[i] for i in range(n)]
         assert result.event_count == sum(1 for v in result.amplitudes if v)
+
+
+class TestRobustKernelTolerance:
+    """Robust mode: the event train must fit every allowed kernel."""
+
+    def brute_force_robust(self, samples, kernel, tolerance, max_residual,
+                           max_amplitude, max_events):
+        """Exhaustive robust reference: optimum key + first unexplainable position."""
+        n, m = len(samples), len(kernel)
+        kernels = list(allowed_kernels(kernel, tolerance))
+        best_key = None
+        explainable = [False] * n
+        for x in itertools.product(range(max_amplitude + 1), repeat=n):
+            events = sum(1 for v in x if v)
+            if events > max_events:
+                continue
+            worst = []
+            prefix_ok = True
+            for i in range(n):
+                w = max(
+                    abs(samples[i] - sum(
+                        k[j] * x[i - j] for j in range(m) if i - j >= 0
+                    ))
+                    for k in kernels
+                )
+                worst.append(w)
+                if w > max_residual:
+                    prefix_ok = False
+                if prefix_ok:
+                    explainable[i] = True
+            if all(w <= max_residual for w in worst):
+                key = (max(worst), sum(worst), events, x)
+                if best_key is None or key < best_key:
+                    best_key = key
+        first_unexplainable = next(
+            (i for i in range(n) if not explainable[i]), None
+        )
+        return best_key, first_unexplainable
+
+    def test_overlapping_pulses_robust_success(self):
+        # Exact samples for kernel [3, 2, 1], taps 0/1 uncertain by 1 (tap 2
+        # must stay at 1 so its minimum stays positive).  The nominal train
+        # already covers every allowed kernel within the residual budget.
+        result = solve(EXACT_SAMPLES, KERNEL, max_residual=30,
+                       max_amplitude=10, max_events=6,
+                       kernel_tolerance=[1, 1, 0])
+        assert result.feasible
+        assert result.robust
+        for k in allowed_kernels(KERNEL, [1, 1, 0]):
+            pred = convolve(result.amplitudes, k)
+            assert all(
+                abs(EXACT_SAMPLES[i] - pred[i]) <= 30 for i in range(len(pred))
+            )
+        assert result.max_abs_residual <= 30
+        assert result.event_count <= 6
+        # Nominal prediction/residuals remain the nominal-kernel figures.
+        assert result.prediction == convolve(result.amplitudes, KERNEL)
+        assert result.residuals == [
+            EXACT_SAMPLES[i] - result.prediction[i]
+            for i in range(len(EXACT_SAMPLES))
+        ]
+
+    def test_intervals_span_all_allowed_kernels(self):
+        result = solve(EXACT_SAMPLES, KERNEL, max_residual=30,
+                       max_amplitude=10, max_events=6,
+                       kernel_tolerance=[1, 1, 0])
+        assert result.feasible
+        n = len(EXACT_SAMPLES)
+        for i in range(n):
+            preds = [convolve(result.amplitudes, k)[i]
+                     for k in allowed_kernels(KERNEL, [1, 1, 0])]
+            assert result.prediction_intervals[i] == [min(preds), max(preds)]
+            assert result.residual_intervals[i] == [
+                EXACT_SAMPLES[i] - max(preds),
+                EXACT_SAMPLES[i] - min(preds),
+            ]
+        # Objectives under tolerance are worst-case figures.
+        worst = [max(abs(lo), abs(hi)) for lo, hi in result.residual_intervals]
+        assert result.max_abs_residual == max(worst)
+        assert result.sum_abs_residual == sum(worst)
+        # Nominal figures stay available and lie inside the intervals.
+        for i in range(n):
+            lo, hi = result.prediction_intervals[i]
+            assert lo <= result.prediction[i] <= hi
+            rlo, rhi = result.residual_intervals[i]
+            assert rlo <= result.residuals[i] <= rhi
+
+    def test_tight_radius_robust_infeasible_position(self):
+        # With +/-1 tap uncertainty the exact waveform cannot be reproduced
+        # with zero residual; the first failure is at sample 4 (first pulse).
+        result = solve(EXACT_SAMPLES, KERNEL, max_residual=0,
+                       max_amplitude=10, max_events=6,
+                       kernel_tolerance=[1, 1, 0])
+        assert not result.feasible
+        assert result.robust
+        assert result.first_unexplainable_position == 4
+
+    def test_zero_tolerance_matches_nominal(self):
+        robust = solve(NOISY_SAMPLES, KERNEL, max_residual=1,
+                       max_amplitude=10, max_events=6,
+                       kernel_tolerance=[0, 0, 0])
+        nominal = solve(NOISY_SAMPLES, KERNEL, max_residual=1,
+                        max_amplitude=10, max_events=6)
+        assert robust.feasible and robust.robust
+        assert robust.amplitudes == nominal.amplitudes
+        assert robust.max_abs_residual == nominal.max_abs_residual
+        assert robust.sum_abs_residual == nominal.sum_abs_residual
+        assert robust.event_count == nominal.event_count
+        assert robust.prediction == nominal.prediction
+        assert robust.residuals == nominal.residuals
+        assert robust.prediction_intervals == [[p, p] for p in nominal.prediction]
+        assert robust.residual_intervals == [[r, r] for r in nominal.residuals]
+
+    @pytest.mark.parametrize("seed", range(40))
+    def test_matches_exhaustive_search(self, seed):
+        rng = random.Random(1000 + seed)
+        n, m = 7, 3
+        kernel = [rng.randint(2, 4) for _ in range(m)]
+        tolerance = [rng.randint(0, 1) for _ in range(m)]
+        max_amplitude = 2
+        max_events = rng.randint(0, 4)
+        max_residual = rng.randint(0, 3)
+        if seed % 2 == 0:
+            true_x = [rng.randint(0, max_amplitude) for _ in range(n)]
+            samples = [v + rng.randint(-1, 1) for v in convolve(true_x, kernel)]
+        else:
+            samples = [rng.randint(-2, 12) for _ in range(n)]
+
+        result = solve(samples, kernel, max_residual, max_amplitude, max_events,
+                       kernel_tolerance=tolerance)
+        best_key, first_unexplainable = self.brute_force_robust(
+            samples, kernel, tolerance, max_residual, max_amplitude, max_events
+        )
+
+        if best_key is None:
+            assert not result.feasible
+            assert result.first_unexplainable_position == first_unexplainable
+            return
+
+        assert result.feasible
+        exp_max, exp_sum, exp_events, exp_x = best_key
+        assert result.max_abs_residual == exp_max
+        assert result.sum_abs_residual == exp_sum
+        assert result.event_count == exp_events
+        assert tuple(result.amplitudes) == exp_x
+        assert result.event_count == sum(1 for v in result.amplitudes if v)
+
+    def test_full_size_robust_instance(self):
+        rng = random.Random(1)
+        n, m = 36, 6
+        kernel = [rng.randint(2, 4) for _ in range(m)]
+        tolerance = [1] * m
+        true_x = [rng.choice([0, 0, 0, 1, 2]) for _ in range(n)]
+        samples = convolve(true_x, kernel)
+        result = solve(samples, kernel, max_residual=6, max_amplitude=9,
+                       max_events=n, kernel_tolerance=tolerance)
+        assert result.feasible
+        assert len(result.prediction_intervals) == n
+        assert len(result.residual_intervals) == n
+        for k in allowed_kernels(kernel, tolerance):
+            pred = convolve(result.amplitudes, k)
+            assert all(abs(samples[i] - pred[i]) <= 6 for i in range(n))
 
 
 class TestScaling:

@@ -77,18 +77,24 @@ def deconvolve(req: DeconvolveRequest):
         max_residual=req.maxResidual,
         max_amplitude=req.maxAmplitude,
         max_events=req.maxEvents,
+        kernel_tolerance=req.kernelTolerance,
     )
     if not result.feasible:
         body = InfeasibleResponse(
-            firstUnexplainablePosition=result.first_unexplainable_position
+            firstUnexplainablePosition=result.first_unexplainable_position,
+            robust=result.robust,
         )
-        return JSONResponse(status_code=422, content=body.model_dump())
+        content = body.model_dump()
+        if not result.robust:
+            # Nominal failure body keeps the original shape exactly.
+            content.pop("robust")
+        return JSONResponse(status_code=422, content=content)
     events = [
         Event(position=i, amplitude=a)
         for i, a in enumerate(result.amplitudes)
         if a > 0
     ]
-    return DeconvolveSuccessResponse(
+    response = DeconvolveSuccessResponse(
         events=events,
         amplitudes=result.amplitudes,
         prediction=result.prediction,
@@ -98,4 +104,14 @@ def deconvolve(req: DeconvolveRequest):
             sumAbsResidual=result.sum_abs_residual,
             eventCount=result.event_count,
         ),
+        robust=result.robust,
+        predictionIntervals=result.prediction_intervals,
+        residualIntervals=result.residual_intervals,
     )
+    content = response.model_dump()
+    if not result.robust:
+        # Nominal success body keeps the original shape exactly.
+        content.pop("robust")
+        content.pop("predictionIntervals")
+        content.pop("residualIntervals")
+    return JSONResponse(status_code=200, content=content)
