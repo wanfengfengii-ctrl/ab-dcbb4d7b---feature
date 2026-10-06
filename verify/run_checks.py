@@ -228,6 +228,94 @@ class Smoke:
         })
         self.check("oversized kernel rejected with 400", code == 400, f"got {code}")
 
+        # Case 6: kernel calibration uncertainty -- one event train must cover
+        # every admissible kernel (first tap in {2,3,4}).
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 5, "maxAmplitude": 10, "maxEvents": 4,
+            "kernelTolerance": [1, 0, 0],
+        })
+        self.check("robust overlap returns 200", code == 200, f"got {code}: {body}")
+        if code == 200:
+            pred_intervals = body.get("predictionIntervals")
+            res_intervals = body.get("residualIntervals")
+            self.check(
+                "robust overlap events recovered",
+                body.get("events") == [
+                    {"position": 4, "amplitude": 5},
+                    {"position": 6, "amplitude": 4},
+                ],
+                f"got {body.get('events')}",
+            )
+            # Nominal prediction/residuals stay available.
+            self.check("robust overlap nominal prediction preserved",
+                       body.get("prediction") == exact_samples)
+            self.check("robust overlap nominal residuals preserved",
+                       body.get("residuals") == [0] * n)
+            self.check(
+                "robust overlap interval shapes",
+                isinstance(pred_intervals, list) and isinstance(res_intervals, list)
+                and len(pred_intervals) == n and len(res_intervals) == n
+                and all(len(pair) == 2 and pair[0] <= pair[1]
+                        for pair in pred_intervals + res_intervals),
+                f"got {pred_intervals}",
+            )
+            if isinstance(pred_intervals, list) and len(pred_intervals) == n:
+                self.check("robust overlap prediction interval at 4",
+                           pred_intervals[4] == [10, 20],
+                           f"got {pred_intervals[4]}")
+                self.check("robust overlap prediction interval at 6",
+                           pred_intervals[6] == [13, 21],
+                           f"got {pred_intervals[6]}")
+                self.check("robust overlap nominal inside intervals",
+                           all(pred_intervals[i][0] <= p <= pred_intervals[i][1]
+                               for i, p in enumerate(exact_samples)))
+            self.check(
+                "robust overlap worst-case objectives",
+                body.get("objectives") == {
+                    "maxAbsResidual": 5, "sumAbsResidual": 9, "eventCount": 2,
+                },
+                f"got {body.get('objectives')}",
+            )
+
+        # Case 7: no event train covers the whole kernel box at radius 0 ->
+        # identifiable infeasible result with the first robust-unexplainable
+        # sample position.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 0, "maxAmplitude": 10, "maxEvents": 4,
+            "kernelTolerance": [1, 0, 0],
+        })
+        self.check("robust infeasible returns 422", code == 422, f"got {code}: {body}")
+        self.check("robust infeasible flagged infeasible",
+                   body.get("status") == "infeasible", f"got {body}")
+        self.check("robust infeasible first unexplainable position",
+                   body.get("firstUnexplainablePosition") == 4,
+                   f"got {body.get('firstUnexplainablePosition')}")
+
+        # Case 8: malformed kernelTolerance is a per-field request error.
+        code, body = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 5, "maxAmplitude": 10, "maxEvents": 4,
+            "kernelTolerance": [1, 0],
+        })
+        self.check("bad tolerance length rejected with 400", code == 400, f"got {code}")
+        self.check(
+            "bad tolerance attributed to kernelTolerance field",
+            code == 400 and any(
+                "kernelTolerance" in tuple(err.get("loc", ()))
+                for err in body.get("detail", [])
+            ),
+            f"got {body}",
+        )
+        code, _ = _request("POST", "/api/pulses/deconvolve", {
+            "samples": exact_samples, "kernel": kernel,
+            "maxResidual": 5, "maxAmplitude": 10, "maxEvents": 4,
+            "kernelTolerance": [3, 0, 0],
+        })
+        self.check("tolerance erasing a positive tap rejected with 400",
+                   code == 400, f"got {code}")
+
         ok = not self.failures
         print(f"smoke tests: {'PASS' if ok else 'FAIL'}", flush=True)
         return ok

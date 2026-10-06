@@ -62,6 +62,7 @@ def root() -> dict:
 @app.post(
     "/api/pulses/deconvolve",
     response_model=DeconvolveSuccessResponse,
+    response_model_exclude_none=True,
     responses={
         422: {
             "model": InfeasibleResponse,
@@ -77,6 +78,7 @@ def deconvolve(req: DeconvolveRequest):
         max_residual=req.maxResidual,
         max_amplitude=req.maxAmplitude,
         max_events=req.maxEvents,
+        kernel_tolerance=req.kernelTolerance,
     )
     if not result.feasible:
         body = InfeasibleResponse(
@@ -98,4 +100,6 @@ def deconvolve(req: DeconvolveRequest):
             sumAbsResidual=result.sum_abs_residual,
             eventCount=result.event_count,
         ),
+        predictionIntervals=result.prediction_intervals,
+        residualIntervals=result.residual_intervals,
     )
